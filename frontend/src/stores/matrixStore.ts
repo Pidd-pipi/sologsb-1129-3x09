@@ -166,6 +166,8 @@ export const useMatrixStore = create<MatrixState>((set, get) => ({
       targetKind: input.targetKind,
       targetRef: input.targetRef.trim(),
       matrixId: input.matrixId,
+      caseId: input.targetKind === '字盘' ? (input.caseId ?? '') : '',
+      caseSnapshot: input.targetKind === '字盘' ? input.caseSnapshot : undefined,
       pressureKg: Number(input.pressureKg),
       ink: input.ink.trim(),
       impressions: Number(input.impressions),

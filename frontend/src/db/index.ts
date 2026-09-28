@@ -15,6 +15,7 @@ export const DB_NAME = 'gbmovabletype-db';
  * v1 建 matrices
  * v2 加 cases 表与 matrixId 索引
  * v3 加 defects / proofs 表，并为停用字模回填缺损原因
+ * v4 proofs 加 caseId 索引；整盘试印的样张快照随记录落库（无需数据回填）
  */
 class MovableTypeDb extends Dexie {
   matrices!: Table<TypeMatrix, string>;
@@ -78,6 +79,12 @@ class MovableTypeDb extends Dexie {
           });
         }
       });
+    this.version(4).stores({
+      matrices: 'id, code, character, font, sizeName, material, availability',
+      cases: 'id, code, kind, workStation, *matrixId',
+      defects: 'id, matrixId, defectType, severity, availability, foundDate',
+      proofs: 'id, matrixId, caseId, sampleNo, clarity, proofDate',
+    });
   }
 }
 
