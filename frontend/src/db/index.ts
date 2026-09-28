@@ -6,6 +6,7 @@ import type { MatrixAvailability, MatrixFont, MatrixMaterial, TypeMatrix } from 
 import { ptOfSize } from '../types/matrix';
 import type { ProofRecord } from '../types/proof';
 import { matrixIdsOf } from '../utils/layout';
+import { buildCaseSnapshot } from '../utils/proofSnapshot';
 import { suggestCaseCode, suggestMatrixCode, toPlain } from '../utils/format';
 
 export const DB_NAME = 'gbmovabletype-db';
@@ -15,6 +16,7 @@ export const DB_NAME = 'gbmovabletype-db';
  * v1 建 matrices
  * v2 加 cases 表与 matrixId 索引
  * v3 加 defects / proofs 表，并为停用字模回填缺损原因
+ * v4 proofs 加 caseId 索引；整盘试印改挂字盘 id + 盘面样张快照（旧记录只补 caseId 字段）
  */
 class MovableTypeDb extends Dexie {
   matrices!: Table<TypeMatrix, string>;
@@ -76,6 +78,24 @@ class MovableTypeDb extends Dexie {
             note: '由 v2 → v3 升级自动回填',
             createdAt: new Date().toISOString(),
           });
+        }
+      });
+    this.version(4)
+      .stores({
+        matrices: 'id, code, character, font, sizeName, material, availability',
+        cases: 'id, code, kind, workStation, *matrixId',
+        defects: 'id, matrixId, defectType, severity, availability, foundDate',
+        proofs: 'id, matrixId, caseId, sampleNo, clarity, proofDate',
+      })
+      .upgrade(async (tx) => {
+        // v4：整盘试印从「只记字盘编号」改为挂字盘 id + 样张快照。
+        // 历史记录登记时的盘面已无从还原，只补齐 caseId 空字段与快照缺省，
+        // 台账照常按原编号展示（UI 标注为早期编号记录、无盘面快照）。
+        const table = tx.table<ProofRecord, string>('proofs');
+        const rows = await table.toArray();
+        for (const row of rows) {
+          if (row.caseId !== undefined) continue;
+          await table.update(row.id, { caseId: '' });
         }
       });
   }
@@ -169,6 +189,7 @@ interface SeedProof {
   targetKind: '字符' | '字盘';
   targetRef: string;
   matrixId: string;
+  caseId: string;
   pressureKg: number;
   ink: string;
   impressions: number;
@@ -179,12 +200,15 @@ interface SeedProof {
 }
 
 const SEED_PROOFS: SeedProof[] = [
-  { id: 'pfr-3001', targetKind: '字符', targetRef: '活', matrixId: 'm-1001', pressureKg: 12.5, ink: '油烟墨 101', impressions: 40, sampleNo: 'YZ-20250512-01', clarity: '清晰', proofDate: '2025-05-12', note: '字口饱满，留作标准样张' },
-  { id: 'pfr-3002', targetKind: '字符', targetRef: '字', matrixId: 'm-1002', pressureKg: 10, ink: '松烟墨 08', impressions: 32, sampleNo: 'YZ-20250512-02', clarity: '偏淡', proofDate: '2025-05-12', note: '压力偏低，建议加压至 12kg' },
-  { id: 'pfr-3003', targetKind: '字符', targetRef: '墨', matrixId: 'm-1011', pressureKg: 14, ink: '油烟墨 101', impressions: 25, sampleNo: 'YZ-20250513-01', clarity: '糊版', proofDate: '2025-05-13', note: '缺笔叠加糊版，判定停用' },
-  { id: 'pfr-3004', targetKind: '字盘', targetRef: 'ZP-A-01', matrixId: '', pressureKg: 18.5, ink: '油烟墨 101', impressions: 60, sampleNo: 'YZ-20250518-01', clarity: '清晰', proofDate: '2025-05-18', note: '整盘试印，行列对齐良好' },
-  { id: 'pfr-3005', targetKind: '字符', targetRef: '模', matrixId: 'm-1008', pressureKg: 11.5, ink: '松烟墨 08', impressions: 28, sampleNo: 'YZ-20250520-03', clarity: '糊版', proofDate: '2025-05-20', note: '磨损导致笔画发虚' },
-  { id: 'pfr-3006', targetKind: '字符', targetRef: '纸', matrixId: 'm-1012', pressureKg: 9.5, ink: '松烟墨 08', impressions: 50, sampleNo: 'YZ-20250601-01', clarity: '清晰', proofDate: '2025-06-01', note: '' },
+  { id: 'pfr-3001', targetKind: '字符', targetRef: '活', matrixId: 'm-1001', caseId: '', pressureKg: 12.5, ink: '油烟墨 101', impressions: 40, sampleNo: 'YZ-20250512-01', clarity: '清晰', proofDate: '2025-05-12', note: '字口饱满，留作标准样张' },
+  { id: 'pfr-3002', targetKind: '字符', targetRef: '字', matrixId: 'm-1002', caseId: '', pressureKg: 10, ink: '松烟墨 08', impressions: 32, sampleNo: 'YZ-20250512-02', clarity: '偏淡', proofDate: '2025-05-12', note: '压力偏低，建议加压至 12kg' },
+  { id: 'pfr-3003', targetKind: '字符', targetRef: '墨', matrixId: 'm-1011', caseId: '', pressureKg: 14, ink: '油烟墨 101', impressions: 25, sampleNo: 'YZ-20250513-01', clarity: '糊版', proofDate: '2025-05-13', note: '缺笔叠加糊版，判定停用' },
+  // 早期整盘试印只记了字盘编号，保留无快照形态以验证旧记录照常可看
+  { id: 'pfr-3004', targetKind: '字盘', targetRef: 'ZP-A-01', matrixId: '', caseId: '', pressureKg: 18.5, ink: '油烟墨 101', impressions: 60, sampleNo: 'YZ-20250518-01', clarity: '清晰', proofDate: '2025-05-18', note: '整盘试印，行列对齐良好' },
+  { id: 'pfr-3005', targetKind: '字符', targetRef: '模', matrixId: 'm-1008', caseId: '', pressureKg: 11.5, ink: '松烟墨 08', impressions: 28, sampleNo: 'YZ-20250520-03', clarity: '糊版', proofDate: '2025-05-20', note: '磨损导致笔画发虚' },
+  { id: 'pfr-3006', targetKind: '字符', targetRef: '纸', matrixId: 'm-1012', caseId: '', pressureKg: 9.5, ink: '松烟墨 08', impressions: 50, sampleNo: 'YZ-20250601-01', clarity: '清晰', proofDate: '2025-06-01', note: '' },
+  // 新版整盘试印：挂字盘 id 并固化盘面样张快照
+  { id: 'pfr-3007', targetKind: '字盘', targetRef: 'ZP-B-02', matrixId: '', caseId: 'case-1002', pressureKg: 15, ink: '油烟墨 101', impressions: 36, sampleNo: 'YZ-20250605-01', clarity: '清晰', proofDate: '2025-06-05', note: '生僻字盘整盘试印，样张已留盘面快照' },
 ];
 
 function buildSeed() {
@@ -232,7 +256,15 @@ function buildSeed() {
       createdAt: now,
     };
   });
-  const proofs: ProofRecord[] = SEED_PROOFS.map((p) => ({ ...p, createdAt: now }));
+  const proofs: ProofRecord[] = SEED_PROOFS.map((p) => {
+    // 新版整盘试印种子：按当时盘面固化样张快照
+    if (p.id === 'pfr-3007') {
+      const typeCase = cases[1];
+      const snapshot = buildCaseSnapshot(typeCase, matrices);
+      return { ...p, createdAt: now, caseSnapshot: snapshot ?? undefined };
+    }
+    return { ...p, createdAt: now };
+  });
   return { matrices, cases, defects, proofs };
 }
 

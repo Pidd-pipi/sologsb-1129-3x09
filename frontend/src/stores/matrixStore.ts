@@ -161,11 +161,14 @@ export const useMatrixStore = create<MatrixState>((set, get) => ({
 
   addProof: async (input) => {
     const matrix = input.matrixId ? get().matrices.find((m) => m.id === input.matrixId) : undefined;
+    const isCaseProof = input.targetKind === '字盘';
     const row: ProofRecord = toPlain({
       id: makeId('pfr'),
       targetKind: input.targetKind,
       targetRef: input.targetRef.trim(),
-      matrixId: input.matrixId,
+      matrixId: isCaseProof ? '' : input.matrixId,
+      caseId: isCaseProof ? (input.caseId ?? '') : '',
+      caseSnapshot: isCaseProof ? input.caseSnapshot : undefined,
       pressureKg: Number(input.pressureKg),
       ink: input.ink.trim(),
       impressions: Number(input.impressions),

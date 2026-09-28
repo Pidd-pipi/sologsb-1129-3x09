@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import { Link } from 'react-router-dom';
 import EmptyState from '../components/common/EmptyState';
+import ProofSnapshotGrid from '../components/common/ProofSnapshotGrid';
 import { DRAFT_KEYS, useLocalDraft } from '../hooks/useLocalDraft';
+import { useCaseStore } from '../stores/caseStore';
 import { useMatrixStore } from '../stores/matrixStore';
 import { useUiStore } from '../stores/uiStore';
+import { describeCapacity } from '../types/case';
 import {
   CLARITY_LEVELS,
   IMPRESSION_RANGE,
@@ -12,13 +15,16 @@ import {
   validateProofInput,
   type ClarityLevel,
   type ProofInput,
+  type ProofRecord,
   type ProofTargetKind,
 } from '../types/proof';
 import { dash, formatDate, suggestSampleNo, todayStr } from '../utils/format';
+import { buildCaseSnapshot, inspectCaseForProof, slotCoord } from '../utils/proofSnapshot';
 
 interface ProofFormState {
   targetKind: ProofTargetKind;
   matrixId: string;
+  caseId: string;
   targetRef: string;
   pressureKg: string;
   ink: string;
@@ -29,12 +35,14 @@ interface ProofFormState {
   note: string;
 }
 
-/** `/proofs` 试印记录：登记压力、用墨与清晰度评价，按样张编号回溯试印批次 */
+/** `/proofs` 试印记录：单字登记，整盘试印从现有字盘选择并固化盘面样张快照 */
 export default function ProofList() {
   const matrices = useMatrixStore((s) => s.matrices);
   const proofs = useMatrixStore((s) => s.proofs);
   const proofCount = useMatrixStore((s) => s.proofs.length);
   const addProof = useMatrixStore((s) => s.addProof);
+  const cases = useCaseStore((s) => s.cases);
+  const casesLoaded = useCaseStore((s) => s.loaded);
   const pushToast = useUiStore((s) => s.pushToast);
   const sampleQuery = useUiStore((s) => s.sampleQuery);
   const setSampleQuery = useUiStore((s) => s.setSampleQuery);
@@ -44,6 +52,7 @@ export default function ProofList() {
     {
       targetKind: '字符',
       matrixId: '',
+      caseId: '',
       targetRef: '',
       pressureKg: '12.5',
       ink: '油烟墨 101',
@@ -61,6 +70,10 @@ export default function ProofList() {
   }, [draft.matrixId, matrices, patch]);
 
   const selectedMatrix = matrices.find((m) => m.id === draft.matrixId);
+  const selectedCase = useMemo(
+    () => cases.find((c) => c.id === draft.caseId),
+    [cases, draft.caseId],
+  );
 
   useEffect(() => {
     if (draft.targetKind === '字符' && selectedMatrix) {
@@ -68,11 +81,26 @@ export default function ProofList() {
     }
   }, [draft.targetKind, selectedMatrix, patch]);
 
+  useEffect(() => {
+    if (draft.targetKind === '字盘' && selectedCase) {
+      patch({ targetRef: selectedCase.code });
+    }
+  }, [draft.targetKind, selectedCase, patch]);
+
+  /** 整盘试印预检：停用 / 待补刻 / 缺档格位逐格列出，不通过则不生成样张 */
+  const caseInspection = useMemo(() => {
+    if (draft.targetKind !== '字盘' || !selectedCase) return null;
+    return inspectCaseForProof(selectedCase, matrices);
+  }, [draft.targetKind, selectedCase, matrices]);
+
   const traced = useMemo(() => {
     const q = sampleQuery.trim().toLowerCase();
     if (!q) return [];
     return proofs.filter(
-      (p) => p.sampleNo.toLowerCase().includes(q) || p.targetRef.toLowerCase().includes(q),
+      (p) =>
+        p.sampleNo.toLowerCase().includes(q) ||
+        p.targetRef.toLowerCase().includes(q) ||
+        (p.caseSnapshot?.slots.some((s) => s.character.toLowerCase().includes(q)) ?? false),
     );
   }, [proofs, sampleQuery]);
 
@@ -86,10 +114,11 @@ export default function ProofList() {
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
+    const isCaseProof = draft.targetKind === '字盘';
     const input: ProofInput = {
       targetKind: draft.targetKind,
-      targetRef: draft.targetRef,
-      matrixId: draft.targetKind === '字符' ? draft.matrixId : '',
+      targetRef: isCaseProof ? selectedCase?.code ?? draft.targetRef : draft.targetRef,
+      matrixId: draft.matrixId,
       pressureKg: Number(draft.pressureKg),
       ink: draft.ink,
       impressions: Number(draft.impressions),
@@ -98,6 +127,26 @@ export default function ProofList() {
       proofDate: draft.proofDate,
       note: draft.note,
     };
+    if (isCaseProof) {
+      input.caseId = draft.caseId;
+      if (!selectedCase) {
+        setErrors({ caseId: '请从现有字盘中选择试印字盘' });
+        pushToast('请先选择试印字盘', 'warn');
+        return;
+      }
+      const inspection = inspectCaseForProof(selectedCase, matrices);
+      if (!inspection.ready) {
+        setErrors({ caseId: inspection.message });
+        pushToast('盘面存在待处理格位，请先处理后再生成样张', 'warn');
+        return;
+      }
+      const snapshot = buildCaseSnapshot(selectedCase, matrices);
+      if (!snapshot) {
+        pushToast('样张快照生成失败，请检查盘面落位', 'error');
+        return;
+      }
+      input.caseSnapshot = snapshot;
+    }
     const next = validateProofInput(input);
     setErrors(next);
     if (Object.keys(next).length > 0) {
@@ -105,7 +154,11 @@ export default function ProofList() {
       return;
     }
     await addProof(input);
-    pushToast(`已登记试印样张 ${input.sampleNo}（${input.clarity}）`);
+    pushToast(
+      isCaseProof
+        ? `已登记整盘试印样张 ${input.sampleNo}，盘面快照已随样张留存`
+        : `已登记试印样张 ${input.sampleNo}（${input.clarity}）`,
+    );
     patch({
       note: '',
       sampleNo: suggestSampleNo(todayStr(), proofs.length + 2),
@@ -118,6 +171,11 @@ export default function ProofList() {
     [proofs],
   );
 
+  const caseProofs = useMemo(
+    () => sortedProofs.filter((p) => p.targetKind === '字盘'),
+    [sortedProofs],
+  );
+
   return (
     <div className="space-y-4">
       <section className="flex flex-wrap items-end justify-between gap-3">
@@ -126,7 +184,7 @@ export default function ProofList() {
             试印记录
           </h2>
           <p className="mt-sub">
-            登记压力（0.5–60 kg）、用墨与清晰度评价，按样张编号回溯试印批次与对应字模。
+            单字试印关联字模；整盘试印从现有字盘选择，自动固化行列、工位与每格字符 / 字模编号，盘面日后调整不影响旧样张。
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -159,7 +217,13 @@ export default function ProofList() {
                 data-testid="proof-target-kind"
                 className="mt-input"
                 value={draft.targetKind}
-                onChange={(e) => patch({ targetKind: e.target.value as ProofTargetKind })}
+                onChange={(e) => {
+                  patch({
+                    targetKind: e.target.value as ProofTargetKind,
+                    caseId: e.target.value === '字盘' && !draft.caseId && cases[0] ? cases[0].id : draft.caseId,
+                  });
+                  setErrors({});
+                }}
               >
                 {PROOF_TARGET_KINDS.map((k) => (
                   <option key={k} value={k}>
@@ -168,45 +232,104 @@ export default function ProofList() {
                 ))}
               </select>
             </div>
-            <div className="md:col-span-2">
-              <label className="mt-label" htmlFor="proof-matrix-select">
-                关联字模
-              </label>
-              <select
-                id="proof-matrix-select"
-                data-testid="proof-matrix-select"
-                className="mt-input"
-                value={draft.matrixId}
-                disabled={draft.targetKind === '字盘'}
-                onChange={(e) => patch({ matrixId: e.target.value })}
-              >
-                <option value="">不关联具体字模</option>
-                {matrices.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.character} · {m.code} · {m.font}/{m.sizeName}
-                  </option>
-                ))}
-              </select>
-              {errors.matrixId ? <p className="mt-error">{errors.matrixId}</p> : null}
-            </div>
-            <div>
-              <label className="mt-label" htmlFor="proof-target-ref">
-                字符 / 字盘编号
-              </label>
-              <input
-                id="proof-target-ref"
-                data-testid="proof-target-ref"
-                className="mt-input"
-                placeholder={draft.targetKind === '字盘' ? '例：ZP-A-01' : '例：活'}
-                value={draft.targetRef}
-                onChange={(e) => patch({ targetRef: e.target.value })}
-              />
-              {errors.targetRef ? (
-                <p className="mt-error" data-testid="error-targetRef">
-                  {errors.targetRef}
-                </p>
-              ) : null}
-            </div>
+
+            {draft.targetKind === '字盘' ? (
+              <div className="md:col-span-3">
+                <label className="mt-label" htmlFor="proof-case-select">
+                  试印字盘（从现有字盘选择）
+                </label>
+                <select
+                  id="proof-case-select"
+                  data-testid="proof-case-select"
+                  className="mt-input"
+                  value={draft.caseId}
+                  onChange={(e) => {
+                    patch({ caseId: e.target.value });
+                    setErrors((prev) => {
+                      const next = { ...prev };
+                      delete next.caseId;
+                      return next;
+                    });
+                  }}
+                >
+                  {cases.length === 0 ? (
+                    <option value="">暂无字盘，请先到字盘布局建档</option>
+                  ) : null}
+                  {cases.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.code} · {c.kind} · {describeCapacity(c.rows, c.cols)} · 已落位 {c.slots.length} ·{' '}
+                      {c.workStation}
+                    </option>
+                  ))}
+                </select>
+                {errors.caseId ? (
+                  <p className="mt-error" data-testid="error-caseId">
+                    {errors.caseId}
+                  </p>
+                ) : selectedCase ? (
+                  <p className="mt-hint" data-testid="proof-case-summary">
+                    {selectedCase.code} · {describeCapacity(selectedCase.rows, selectedCase.cols)} · 工位{' '}
+                    {selectedCase.workStation}
+                  </p>
+                ) : (
+                  <p className="mt-hint">
+                    {casesLoaded && cases.length === 0 ? (
+                      <>
+                        还没有字盘，先到{' '}
+                        <Link className="text-seal hover:underline" to="/cases">
+                          字盘布局
+                        </Link>{' '}
+                        建档并落位。
+                      </>
+                    ) : (
+                      '请选择试印字盘'
+                    )}
+                  </p>
+                )}
+              </div>
+            ) : (
+              <>
+                <div className="md:col-span-2">
+                  <label className="mt-label" htmlFor="proof-matrix-select">
+                    关联字模
+                  </label>
+                  <select
+                    id="proof-matrix-select"
+                    data-testid="proof-matrix-select"
+                    className="mt-input"
+                    value={draft.matrixId}
+                    onChange={(e) => patch({ matrixId: e.target.value })}
+                  >
+                    <option value="">不关联具体字模</option>
+                    {matrices.map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.character} · {m.code} · {m.font}/{m.sizeName}
+                      </option>
+                    ))}
+                  </select>
+                  {errors.matrixId ? <p className="mt-error">{errors.matrixId}</p> : null}
+                </div>
+                <div>
+                  <label className="mt-label" htmlFor="proof-target-ref">
+                    字符
+                  </label>
+                  <input
+                    id="proof-target-ref"
+                    data-testid="proof-target-ref"
+                    className="mt-input"
+                    placeholder="例：活"
+                    value={draft.targetRef}
+                    onChange={(e) => patch({ targetRef: e.target.value })}
+                  />
+                  {errors.targetRef ? (
+                    <p className="mt-error" data-testid="error-targetRef">
+                      {errors.targetRef}
+                    </p>
+                  ) : null}
+                </div>
+              </>
+            )}
+
             <div>
               <label className="mt-label" htmlFor="proof-pressure-input">
                 压力 kg
@@ -348,8 +471,57 @@ export default function ProofList() {
               />
             </div>
           </div>
+
+          {draft.targetKind === '字盘' && selectedCase && caseInspection ? (
+            <div
+              className={`rounded border px-3 py-2 text-xs ${
+                caseInspection.ready
+                  ? 'border-jade/40 bg-jade-pale text-jade'
+                  : 'border-seal/40 bg-seal-pale text-seal'
+              }`}
+              data-testid="proof-case-inspection"
+              data-ready={caseInspection.ready ? '1' : '0'}
+            >
+              {caseInspection.ready ? (
+                <p data-testid="proof-case-ready">
+                  盘面预检通过：已落位 {caseInspection.filled} 格，全部为可用字模，登记时将固化{' '}
+                  {selectedCase.rows} 行 × {selectedCase.cols} 列、工位 {selectedCase.workStation}{' '}
+                  与每格字符 / 字模编号作为样张快照。
+                </p>
+              ) : (
+                <div className="space-y-1">
+                  <p data-testid="proof-case-blocked">{caseInspection.message}本次不生成样张。</p>
+                  <ul className="space-y-0.5" data-testid="proof-case-blockers">
+                    {caseInspection.blockers.map((b) => (
+                      <li key={`${b.row}-${b.col}`} data-testid={`proof-blocker-${b.row}-${b.col}`}>
+                        {slotCoord(b.row, b.col)} 格「{b.character}」·{' '}
+                        {b.matrixCode || b.matrixId || '字模编号缺失'} · {b.reason}
+                      </li>
+                    ))}
+                  </ul>
+                  <p>
+                    可先到{' '}
+                    <Link className="font-semibold underline" to="/cases">
+                      字盘布局
+                    </Link>{' '}
+                    取出 / 更换格位，或到{' '}
+                    <Link className="font-semibold underline" to="/defects">
+                      缺损登记
+                    </Link>{' '}
+                    处理停用、完成补刻后再试印。
+                  </p>
+                </div>
+              )}
+            </div>
+          ) : null}
+
           <div className="flex flex-wrap items-center gap-2">
-            <button type="submit" className="mt-btn mt-btn-primary" data-testid="submit-proof">
+            <button
+              type="submit"
+              className="mt-btn mt-btn-primary"
+              data-testid="submit-proof"
+              disabled={draft.targetKind === '字盘' && caseInspection !== null && !caseInspection.ready}
+            >
               登记试印
             </button>
             <button
@@ -365,7 +537,8 @@ export default function ProofList() {
               清空草稿
             </button>
             <span className="mt-hint">
-              当前对象：{draft.targetKind} · {dash(draft.targetRef)}
+              当前对象：{draft.targetKind} ·{' '}
+              {draft.targetKind === '字盘' ? dash(selectedCase?.code ?? draft.targetRef) : dash(draft.targetRef)}
             </span>
           </div>
         </form>
@@ -376,7 +549,7 @@ export default function ProofList() {
           <h3 className="font-song text-sm font-semibold text-ink">按样张编号回溯</h3>
           <input
             className="mt-input max-w-[240px]"
-            placeholder="输入样张编号片段，例：YZ-2025"
+            placeholder="输入样张编号或盘面字符，例：YZ-2025"
             data-testid="sample-search-input"
             value={sampleQuery}
             onChange={(e) => setSampleQuery(e.target.value)}
@@ -384,7 +557,7 @@ export default function ProofList() {
         </div>
         <div className="px-4 py-3">
           {sampleQuery.trim() === '' ? (
-            <p className="text-xs text-ink-mute">输入样张编号或字符即可回溯试印批次与对应字模。</p>
+            <p className="text-xs text-ink-mute">输入样张编号、字盘编号或盘面字符即可回溯试印批次与样张快照。</p>
           ) : traced.length === 0 ? (
             <EmptyState
               title="没有匹配的试印记录"
@@ -400,19 +573,37 @@ export default function ProofList() {
                     <span className="mt-chip">{p.clarity}</span>
                     <span className="text-ink-mute">{formatDate(p.proofDate)}</span>
                     <span className="text-ink-soft">
-                      {p.pressureKg} kg · {p.ink} · 印次 {p.impressions}
+                      {p.targetKind} · {p.targetRef} · {p.pressureKg} kg · {p.ink} · 印次 {p.impressions}
                     </span>
-                    {p.matrixId ? (
+                    {p.targetKind === '字盘' ? (
+                      <a className="mt-btn mt-btn-ghost" href={`#snapshot-${p.id}`} data-testid={`trace-snapshot-${p.id}`}>
+                        {p.caseSnapshot ? '查看盘面快照' : '旧记录（仅编号）'}
+                      </a>
+                    ) : p.matrixId ? (
                       <Link className="mt-btn mt-btn-ghost" to={`/matrices/${p.matrixId}`} data-testid={`trace-matrix-${p.id}`}>
                         回溯字模
                       </Link>
                     ) : (
-                      <span className="text-ink-mute">整盘试印，未关联单枚字模</span>
+                      <span className="text-ink-mute">未关联单枚字模</span>
                     )}
                   </div>
                 </li>
               ))}
             </ul>
+          )}
+        </div>
+      </section>
+
+      <section className="mt-panel">
+        <div className="mt-panel-head">
+          <h3 className="font-song text-sm font-semibold text-ink">整盘样张台账（盘面快照）</h3>
+          <span className="mt-sub">共 {caseProofs.length} 条整盘试印</span>
+        </div>
+        <div className="space-y-4 px-4 py-3">
+          {caseProofs.length === 0 ? (
+            <p className="text-xs text-ink-mute">暂无整盘试印记录。</p>
+          ) : (
+            caseProofs.map((p) => <CaseProofCard key={p.id} proof={p} currentCode={cases.find((c) => c.id === p.caseId)?.code} />)
           )}
         </div>
       </section>
@@ -432,7 +623,7 @@ export default function ProofList() {
                 <th className="mt-th">印次</th>
                 <th className="mt-th">清晰度</th>
                 <th className="mt-th">试印日期</th>
-                <th className="mt-th">字模</th>
+                <th className="mt-th">字模 / 样张</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-paper-line">
@@ -468,7 +659,17 @@ export default function ProofList() {
                     </td>
                     <td className="mt-td">{formatDate(p.proofDate)}</td>
                     <td className="mt-td">
-                      {p.matrixId ? (
+                      {p.targetKind === '字盘' ? (
+                        p.caseSnapshot ? (
+                          <a className="text-seal hover:underline" href={`#snapshot-${p.id}`} data-testid={`proof-snapshot-link-${p.id}`}>
+                            查看盘面快照
+                          </a>
+                        ) : (
+                          <span className="text-ink-mute" data-testid={`proof-legacy-${p.id}`}>
+                            早期记录 · 仅存编号
+                          </span>
+                        )
+                      ) : p.matrixId ? (
                         <Link
                           className="text-seal hover:underline"
                           to={`/matrices/${p.matrixId}`}
@@ -488,5 +689,59 @@ export default function ProofList() {
         </div>
       </section>
     </div>
+  );
+}
+
+/** 单条整盘试印样张：展示登记时固化的盘面；只有编号的旧记录给出兼容提示 */
+function CaseProofCard({ proof, currentCode }: { proof: ProofRecord; currentCode?: string }) {
+  const snapshot = proof.caseSnapshot;
+  const codeChanged = Boolean(snapshot && currentCode && currentCode !== snapshot.caseCode);
+
+  return (
+    <article
+      className="rounded border border-paper-line bg-white/60 px-4 py-3"
+      id={`snapshot-${proof.id}`}
+      data-testid={`case-proof-card-${proof.id}`}
+    >
+      <div className="flex flex-wrap items-center gap-2 text-xs">
+        <span className="font-song text-sm text-ink">{proof.sampleNo}</span>
+        <span
+          className={`mt-chip ${
+            proof.clarity === '清晰'
+              ? 'border-jade/40 text-jade'
+              : proof.clarity === '偏淡'
+                ? 'border-brass/40 text-brass'
+                : 'border-seal/40 text-seal'
+          }`}
+        >
+          {proof.clarity}
+        </span>
+        <span className="text-ink-mute">{formatDate(proof.proofDate)}</span>
+        <span className="text-ink-soft">
+          {proof.pressureKg} kg · {proof.ink} · 印次 {proof.impressions}
+        </span>
+        {snapshot ? (
+          <span className="mt-chip" data-testid={`snapshot-meta-${proof.id}`}>
+            快照盘面 {snapshot.rows}×{snapshot.cols} · {snapshot.slots.length} 格 · 工位 {snapshot.workStation}
+          </span>
+        ) : null}
+      </div>
+
+      {snapshot ? (
+        <div className="mt-3 space-y-2">
+          <p className="text-[11px] text-ink-mute" data-testid={`snapshot-head-${proof.id}`}>
+            登记时盘面：{snapshot.caseCode}（{snapshot.caseKind}）
+            {codeChanged ? ` · 该字盘当前编号已变为 ${currentCode}，样张仍按登记时盘面展示` : ''}
+          </p>
+          <ProofSnapshotGrid snapshot={snapshot} testIdPrefix={`snapshot-${proof.id}`} />
+        </div>
+      ) : (
+        <p className="mt-2 text-[11px] text-ink-mute" data-testid={`snapshot-legacy-${proof.id}`}>
+          这是改版前登记的整盘试印记录，当时只记下了字盘编号「{proof.targetRef}」，登记时盘面已无从还原；编号与试印结论照常保留可查。
+        </p>
+      )}
+
+      {proof.note ? <p className="mt-2 text-[11px] text-ink-mute">备注：{proof.note}</p> : null}
+    </article>
   );
 }
